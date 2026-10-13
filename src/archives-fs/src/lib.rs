@@ -468,6 +468,7 @@ struct Opened {
     columns: Vec<ic_plugin_api::IcFsColumn>,
     bytes: Vec<u8>,
     error: CString,
+    said: CString,
 }
 
 extern "C" fn fs_open_in(
@@ -511,6 +512,7 @@ extern "C" fn fs_open_in(
         columns: Vec::new(),
         bytes: Vec::new(),
         error: CString::default(),
+        said: CString::default(),
     }));
     Box::into_raw(opened) as IcFsHandle
 }
@@ -824,7 +826,15 @@ extern "C" fn fs_remove(handle: IcFsHandle, path: *const c_char) -> c_int {
 }
 
 extern "C" fn fs_last_error(handle: IcFsHandle) -> *const c_char {
-    with_opened(handle, |o| o.error.as_ptr()).unwrap_or(std::ptr::null())
+    with_opened(handle, |o| {
+        o.said = std::mem::take(&mut o.error);
+        if o.said.as_bytes().is_empty() {
+            std::ptr::null()
+        } else {
+            o.said.as_ptr()
+        }
+    })
+    .unwrap_or(std::ptr::null())
 }
 
 pub fn vtable() -> IcFsVTable {
@@ -1320,6 +1330,7 @@ mod tests {
         assert!(!err.is_null());
         let text = unsafe { CStr::from_ptr(err) }.to_string_lossy().to_string();
         assert!(text.contains("not found"), "got: {text}");
+        assert!(fs_last_error(h).is_null(), "the same failure was reported twice");
         fs_close(h);
     }
 
@@ -1667,7 +1678,9 @@ mod tests {
     }
 
     fn last_error_of(handle: IcFsHandle) -> String {
-        unsafe { CStr::from_ptr(fs_last_error(handle)) }
+        let said = fs_last_error(handle);
+        assert!(!said.is_null(), "no reason was given");
+        unsafe { CStr::from_ptr(said) }
             .to_string_lossy()
             .to_string()
     }
