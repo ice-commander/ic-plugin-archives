@@ -861,6 +861,12 @@ pub fn vtable() -> IcFsVTable {
         action_state: None,
         cell_clicked: None,
         set_permissions: None,
+        stream_open: None,
+        stream_read: None,
+        stream_write: None,
+        stream_close: None,
+        copy_within: None,
+        on_disk: None,
     }
 }
 

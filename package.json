@@ -1,6 +1,6 @@
 {
 	"name": "ice-commander-archives",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"private": true,
 	"description": "The version this plugin reports. builder/gen-version.js copies it into version.rs.",
 	"scripts": {
