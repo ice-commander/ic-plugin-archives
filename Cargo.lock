@@ -322,7 +322,7 @@ dependencies = [
 [[package]]
 name = "ic-plugin-api"
 version = "0.1.0"
-source = "git+https://github.com/ice-commander/plugin-api.git?branch=main#1fca3a08bcedf194e20a7a0d01963e7a7aeb8a64"
+source = "git+https://github.com/ice-commander/plugin-api.git?branch=main#ccb9c387ad7f9b7a37a7f563aafacfc222cb0d57"
 
 [[package]]
 name = "inout"
