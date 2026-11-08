@@ -16,6 +16,7 @@ tar = "0.4.40"
 flate2 = "1.0.30"
 bzip2 = "0.4.4"
 chrono = "0.4"
+tempfile = "3"
 
 [features]
 default = ["export-abi"]

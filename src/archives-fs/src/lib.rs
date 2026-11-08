@@ -20,7 +20,14 @@ fn read_whole(source: IcFsSource, path: &CStr) -> Option<Vec<u8>> {
     if host.is_null() {
         return None;
     }
-    let stream = unsafe { ((*host).fs_open)(source, path.as_ptr(), IC_OPEN_READ) };
+    let stream = unsafe {
+        ((*host).fs_open)(
+            source,
+            path.as_ptr(),
+            IC_OPEN_READ,
+            ic_plugin_api::IC_SIZE_UNKNOWN,
+        )
+    };
     if stream.is_null() {
         return None;
     }
@@ -45,7 +52,14 @@ fn write_whole(o: &mut Opened) -> bool {
         o.error = CString::new("there is no filesystem to write to").unwrap_or_default();
         return false;
     }
-    let stream = unsafe { ((*host).fs_open)(o.source, o.path.as_ptr(), IC_OPEN_WRITE) };
+    let stream = unsafe {
+        ((*host).fs_open)(
+            o.source,
+            o.path.as_ptr(),
+            IC_OPEN_WRITE,
+            o.data.len() as u64,
+        )
+    };
     if stream.is_null() {
         o.error = CString::new("the file could not be opened for writing").unwrap_or_default();
         return false;
@@ -305,6 +319,17 @@ pub fn scan_tar_memory(data: &[u8]) -> Result<Scanned, Error> {
 }
 
 pub fn read_listed(data: &[u8], is_tar: bool, at: usize) -> Result<Vec<u8>, Error> {
+    let mut content = Vec::new();
+    unpack_listed(data, is_tar, at, &mut content)?;
+    Ok(content)
+}
+
+fn unpack_listed(
+    data: &[u8],
+    is_tar: bool,
+    at: usize,
+    into: &mut impl std::io::Write,
+) -> Result<u64, Error> {
     let gone = || Error::new("the entry is no longer in the archive");
     if is_tar {
         let mut tar = tar::Archive::new(tar_reader_mem(data));
@@ -317,9 +342,7 @@ pub fn read_listed(data: &[u8], is_tar: bool, at: usize) -> Result<Vec<u8>, Erro
         if entry.header().entry_type().is_dir() {
             return Err(Error::new("Is a directory"));
         }
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        std::io::copy(&mut entry, &mut content).map_err(Error::from_io)?;
-        Ok(content)
+        std::io::copy(&mut entry, into).map_err(Error::from_io)
     } else {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data))
             .map_err(|e| Error::new(e.to_string()))?;
@@ -332,10 +355,35 @@ pub fn read_listed(data: &[u8], is_tar: bool, at: usize) -> Result<Vec<u8>, Erro
         if entry.is_dir() || entry.name().ends_with('/') {
             return Err(Error::new("Is a directory"));
         }
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        std::io::copy(&mut entry, &mut content).map_err(Error::from_io)?;
-        Ok(content)
+        std::io::copy(&mut entry, into).map_err(Error::from_io)
     }
+}
+
+enum Unpacked {
+    OnDisk(std::fs::File),
+    InMemory(std::io::Cursor<Vec<u8>>),
+}
+
+const IN_MEMORY_UP_TO: u64 = 10 * 1024 * 1024;
+
+fn unpacked(o: &Opened, wanted: &str) -> Result<Unpacked, Error> {
+    let Some(slot) = o.listed.find(wanted) else {
+        return Err(Error::new(format!("File not found in archive: {wanted}")));
+    };
+    let at = o.listed.at[slot];
+    let in_memory = || {
+        read_listed(&o.data, o.is_tar, at)
+            .map(|held| Unpacked::InMemory(std::io::Cursor::new(held)))
+    };
+    if o.listed.entries[slot].size <= IN_MEMORY_UP_TO {
+        return in_memory();
+    }
+    let Ok(mut file) = tempfile::tempfile() else {
+        return in_memory();
+    };
+    unpack_listed(&o.data, o.is_tar, at, &mut file)?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(Error::from_io)?;
+    Ok(Unpacked::OnDisk(file))
 }
 
 pub fn read_file_from_archive_memory(
@@ -667,6 +715,51 @@ extern "C" fn fs_read(handle: IcFsHandle, path: *const c_char) -> IcBytes {
     .unwrap_or(IcBytes::EMPTY)
 }
 
+extern "C" fn fs_stream_open(
+    handle: IcFsHandle,
+    path: *const c_char,
+    mode: u32,
+    _size: u64,
+) -> ic_plugin_api::IcFsStream {
+    if mode != IC_OPEN_READ || path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let wanted = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .to_string();
+    let opened = with_opened(handle, |o| match unpacked(o, &wanted) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            o.error = CString::new(e.text().to_string()).unwrap_or_default();
+            None
+        }
+    });
+    match opened.flatten() {
+        Some(stream) => Box::into_raw(Box::new(stream)) as ic_plugin_api::IcFsStream,
+        None => std::ptr::null_mut(),
+    }
+}
+
+extern "C" fn fs_stream_read(stream: ic_plugin_api::IcFsStream, into: *mut u8, len: u64) -> i64 {
+    if stream.is_null() || into.is_null() {
+        return -1;
+    }
+    let open = unsafe { &mut *(stream as *mut Unpacked) };
+    let room = unsafe { std::slice::from_raw_parts_mut(into, len as usize) };
+    let got = match open {
+        Unpacked::OnDisk(file) => std::io::Read::read(file, room),
+        Unpacked::InMemory(held) => std::io::Read::read(held, room),
+    };
+    got.map_or(-1, |n| n as i64)
+}
+
+extern "C" fn fs_stream_close(stream: ic_plugin_api::IcFsStream) -> c_int {
+    if !stream.is_null() {
+        drop(unsafe { Box::from_raw(stream as *mut Unpacked) });
+    }
+    ic_plugin_api::IC_OK
+}
+
 extern "C" fn fs_is_read_only(handle: IcFsHandle) -> c_int {
     match with_opened(handle, |o| o.packing.is_some()) {
         Some(true) => 0,
@@ -861,12 +954,13 @@ pub fn vtable() -> IcFsVTable {
         action_state: None,
         cell_clicked: None,
         set_permissions: None,
-        stream_open: None,
-        stream_read: None,
+        stream_open: Some(fs_stream_open),
+        stream_read: Some(fs_stream_read),
         stream_write: None,
-        stream_close: None,
+        stream_close: Some(fs_stream_close),
         copy_within: None,
         on_disk: None,
+        stream_abort: None,
     }
 }
 
@@ -1050,6 +1144,7 @@ mod tests {
             source: IcFsSource,
             path: *const c_char,
             mode: u32,
+            _size: u64,
         ) -> ic_plugin_api::IcStream {
             let root = unsafe { &*(source as *const std::path::PathBuf) };
             let at = root.join(unsafe { CStr::from_ptr(path) }.to_string_lossy().as_ref());

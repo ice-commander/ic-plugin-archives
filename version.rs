@@ -2,6 +2,6 @@
 // A macro, not a const, so `concat!` can append the NUL the C ABI returns from ic_plugin_version.
 macro_rules! plugins_version {
     () => {
-        "0.1.2"
+        "0.1.3"
     };
 }
